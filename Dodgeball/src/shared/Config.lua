@@ -48,7 +48,11 @@ return {
 	BallGravityScale = 0.3,
 	BallLifetime = 4,
 	ThrowCooldown = 0.5,
-	ThrowRelease = 0.12, -- secondi dal clic al rilascio (sincronizza la palla con il braccio; 0 = istantaneo)
+	ThrowRelease = 0.14, -- secondi dal clic al rilascio: il rilascio è agganciato al punto di massima velocità del braccio
+	ThrowTurnBoost = 3, -- durante il lancio il personaggio ruota verso la mira X volte più in fretta (così il corpo è già girato al rilascio)
+	ThrowOriginTolerance = 9, -- il client comunica dove si trova la mano al rilascio: il server lo accetta solo entro questa distanza (studs) dal petto
+	BallDropCompensation = 1, -- 0..1: quanto il lancio compensa la caduta della palla, così va dove punta il mirino (0 = vecchio comportamento)
+	BallSpin = 0.3, -- rotazione della palla in volo (frazione della rotazione di rotolamento; solo estetica)
 	AimAssistAngle = 7,
 	AimAssistStrength = 0.6,
 	AimAssistRange = 120,
@@ -85,7 +89,7 @@ return {
 	CatchCooldown = 2.5,
 
 	-- Schivata
-	DodgeSpeed = 56,
+	DodgeSpeed = 56, -- velocità iniziale dello scatto (studs/s): poi rallenta dolcemente. Distanza percorsa ≈ DodgeSpeed * DodgeDuration * 0.4
 	DodgeDuration = 0.3,
 	DodgeInvuln = 0.42,
 	DodgeCooldown = 1.5,

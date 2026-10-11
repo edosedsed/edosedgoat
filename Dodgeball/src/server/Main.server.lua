@@ -32,10 +32,11 @@ local allowThrow = makeLimiter(Config.RemoteMinInterval.Throw)
 local allowCatch = makeLimiter(Config.RemoteMinInterval.Catch)
 local allowDodge = makeLimiter(Config.RemoteMinInterval.Dodge)
 
-Remotes.Throw.OnServerEvent:Connect(function(player, target)
+Remotes.Throw.OnServerEvent:Connect(function(player, target, origin)
 	if typeof(target) ~= "Vector3" or target ~= target then return end -- valida (no NaN); distanza e inf li controlla BallService
+	if typeof(origin) ~= "Vector3" or origin ~= origin then origin = nil end -- origine facoltativa: se non valida si ignora
 	if not allowThrow(player) then return end
-	BallService.Throw(player, target)
+	BallService.Throw(player, target, origin)
 end)
 
 Remotes.Catch.OnServerEvent:Connect(function(player)

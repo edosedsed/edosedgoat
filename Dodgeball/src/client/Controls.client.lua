@@ -21,6 +21,9 @@ local camera = workspace.CurrentCamera
 local char, hum, hrp
 local dodging, throwing = false, false
 local dodgeToken = nil
+local throwToken, swing = nil, nil -- lancio in corso (token univoco) e relativa animazione
+local catchAnim = nil -- animazione di presa in corso
+local rawMove = Vector3.zero -- direzione richiesta dal giocatore (prima dello smorzamento)
 local dodgeReady, catchReady, throwReady = 0, 0, 0
 local autoRotateOff = false
 local smoothed = Vector3.zero
@@ -32,11 +35,31 @@ local bufferedDodgeUntil = 0
 
 local dodge -- definita sotto (serve già qui per il buffer)
 
+local function cancelCatch()
+	if catchAnim then
+		catchAnim.Cancel()
+		catchAnim = nil
+	end
+end
+
+-- Annulla il lancio in corso (animazione + rilascio programmato). Il token impedisce che un vecchio rilascio
+-- parta a metà di un lancio nuovo (es. schivata e subito un altro lancio).
+local function cancelThrow()
+	throwToken = nil
+	throwing = false
+	if swing then
+		swing.Cancel()
+		swing = nil
+	end
+end
+
 local function bindChar(c)
 	char = c
 	hum = c:WaitForChild("Humanoid")
 	hrp = c:WaitForChild("HumanoidRootPart")
-	dodging, throwing = false, false
+	dodging = false
+	cancelThrow()
+	cancelCatch()
 	dodgeToken = nil
 	smoothed = Vector3.zero
 	bufferedThrow, bufferedThrowUntil, bufferedDodgeUntil = nil, 0, 0
@@ -53,12 +76,15 @@ local function inMatch()
 end
 
 -- ========== Mira e lancio ==========
+local aimParams = RaycastParams.new() -- riusati a ogni chiamata: niente garbage per frame
+aimParams.FilterType = Enum.RaycastFilterType.Exclude
+local aimFilter = {}
+
 local function aimPoint(screenPos)
 	local ray = camera:ViewportPointToRay(screenPos.X, screenPos.Y)
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { char, workspace:FindFirstChild("Balls") }
-	local result = workspace:Raycast(ray.Origin, ray.Direction * 300, params)
+	aimFilter[1], aimFilter[2] = char, workspace:FindFirstChild("Balls")
+	aimParams.FilterDescendantsInstances = aimFilter
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 300, aimParams)
 	return result and result.Position or (ray.Origin + ray.Direction * 300)
 end
 
@@ -66,28 +92,29 @@ local function flatToward(point)
 	return Vector3.new(point.X - hrp.Position.X, 0, point.Z - hrp.Position.Z)
 end
 
--- Il lancio è sincronizzato con il braccio: la palla parte a metà movimento (Config.ThrowRelease)
--- e la mira viene letta nell'istante del rilascio, non del clic.
+-- Il lancio è sincronizzato con il braccio: la palla parte nel frame di massima velocità della frustata
+-- (Config.ThrowRelease) e la mira viene letta in quell'istante, non al clic.
+-- Insieme alla mira il client invia la posizione della mano: la palla del server parte da lì (vedi BallService.Throw).
 -- Ritorna "ok" (partito), "wait" (non ancora pronto: si può bufferizzare) o "no" (impossibile).
 local function tryThrow(getScreenPos)
 	if not alive() or not inMatch() or not player:GetAttribute("HasBall") then return "no" end
 	if throwing or dodging or os.clock() < throwReady then return "wait" end
 	throwing = true
-	Anim.Swing(char)
-	ClientSettings.PlaySound("Throw")
+	local token = {}
+	throwToken = token
 
 	local function release()
+		if throwToken ~= token then return end -- lancio annullato o già sostituito
+		throwToken = nil
 		throwing = false
 		if not alive() or not inMatch() or dodging or not player:GetAttribute("HasBall") then return end
 		throwReady = os.clock() + Config.ThrowCooldown
-		Remotes.Throw:FireServer(aimPoint(getScreenPos()))
+		local hand = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm")
+		Remotes.Throw:FireServer(aimPoint(getScreenPos()), hand and hand.Position or nil)
 		CameraFX.Kick(3)
+		ClientSettings.PlaySound("Throw")
 	end
-	if Config.ThrowRelease > 0 then
-		task.delay(Config.ThrowRelease, release)
-	else
-		release()
-	end
+	swing = Anim.Swing(char, Config.ThrowRelease, release)
 	return "ok"
 end
 
@@ -147,7 +174,8 @@ RunService.RenderStepped:Connect(function(dt)
 	end
 
 	if not alive() then return end
-	local rotateAlpha = 1 - math.exp(-Config.TurnSpeed * dt)
+	-- durante il lancio il corpo si gira più in fretta verso la mira: al rilascio è già allineato
+	local rotateAlpha = 1 - math.exp(-Config.TurnSpeed * (throwing and Config.ThrowTurnBoost or 1) * dt)
 
 	if CameraFX.IsActive() then
 		-- Shift Lock: il personaggio guarda dove guarda la camera
@@ -176,6 +204,7 @@ end)
 RunService:BindToRenderStep("DodgeballMove", Enum.RenderPriority.Input.Value + 1, function(dt)
 	if not alive() then return end
 	local raw = hum.MoveDirection
+	rawMove = raw -- ultimo input reale (hum.MoveDirection dopo hum:Move() contiene il valore smorzato)
 	if not inMatch() or dodging then
 		smoothed = raw
 		return
@@ -199,8 +228,7 @@ dodge = function()
 	dodgeReady = now + Config.DodgeCooldown
 	player:SetAttribute("DodgeCooldownEnd", dodgeReady)
 
-	local move = hum.MoveDirection
-	move = Vector3.new(move.X, 0, move.Z)
+	local move = Vector3.new(rawMove.X, 0, rawMove.Z)
 	local look = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z).Unit
 	local dir, rollDir
 	if move.Magnitude > 0.1 then
@@ -213,7 +241,8 @@ dodge = function()
 	local token = {}
 	dodgeToken = token
 	dodging = true
-	throwing = false
+	cancelThrow()
+	cancelCatch()
 	Remotes.Dodge:FireServer()
 	CameraFX.Kick(6)
 	ClientSettings.PlaySound("Dodge")
@@ -226,7 +255,7 @@ dodge = function()
 	lv.RelativeTo = Enum.ActuatorRelativeTo.World
 	lv.ForceLimitMode = Enum.ForceLimitMode.PerAxis
 	lv.MaxAxesForce = Vector3.new(1e6, 0, 1e6)
-	lv.VectorVelocity = dir * Config.DodgeSpeed * 0.4
+	lv.VectorVelocity = dir * Config.DodgeSpeed -- parte subito alla massima velocità
 	lv.Parent = hrp
 
 	local conn
@@ -237,6 +266,12 @@ dodge = function()
 		if dodgeToken == token then
 			dodging = false
 			dodgeToken = nil
+			if alive() then
+				-- riparte da quanto stai realmente andando: niente scatto da 0 alla velocità piena
+				local v = hrp.AssemblyLinearVelocity
+				smoothed = Vector3.new(v.X, 0, v.Z) / Config.WalkSpeed
+				if smoothed.Magnitude > 1 then smoothed = smoothed.Unit end
+			end
 		end
 	end
 	conn = RunService.Heartbeat:Connect(function()
@@ -245,19 +280,21 @@ dodge = function()
 			finish()
 			return
 		end
-		local ramp = math.min(1, 0.4 + a * 6) -- accelerazione quasi istantanea
-		lv.VectorVelocity = dir * Config.DodgeSpeed * ramp * (1 - a * a)
+		-- scatto netto che si spegne dolcemente (curva (1-a)^1.5: arriva a velocità 0 senza strappi)
+		lv.VectorVelocity = dir * Config.DodgeSpeed * (1 - a) ^ 1.5
 	end)
 end
 
 -- ========== Presa ==========
 local function catch()
-	if not alive() or player:GetAttribute("HasBall") then return end
+	if not alive() or dodging or player:GetAttribute("HasBall") then return end
 	local now = os.clock()
 	if now < catchReady then return end
 	catchReady = now + Config.CatchCooldown
 	player:SetAttribute("CatchCooldownEnd", catchReady)
 	Remotes.Catch:FireServer()
+	cancelCatch()
+	catchAnim = Anim.Catch(char, Config.CatchWindow)
 	CameraFX.Kick(-3)
 	ClientSettings.PlaySound("Catch")
 end

@@ -6,6 +6,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Config = require(ReplicatedStorage.Shared.Config)
+local Ballistics = require(ReplicatedStorage.Shared.Ballistics)
 
 local BallService = {}
 -- Fire(kind: "Hit" | "Catch", victim: Player, thrower: Player?, ballKind: string)
@@ -69,6 +70,7 @@ local function setIdle(ball)
 	local d = balls[ball]
 	active[ball] = nil
 	ball:SetAttribute("State", "Idle")
+	if not ball.CanCollide then ball.CanCollide = true end -- (la palla "non ancora armata" di un lancio non deve restare fantasma)
 	local idleColor = d and d.idleColor or IDLE_COLOR
 	if ball.Color ~= idleColor then ball.Color = idleColor end
 	if d then
@@ -143,6 +145,8 @@ local function resolveHit(ball, plr)
 		BallService.Hit:Fire("Catch", plr, thrower, d.kind)
 	else
 		ball:SetAttribute("State", "Spent")
+		d.armed = true
+		ball.CanCollide = true -- una palla che ha colpito rimbalza sempre sul giocatore e non attraversa il pavimento
 		ball.Color = d.idleColor
 		d.trail.Enabled = false
 		d.spentUntil = now + Config.SpentTime
@@ -227,6 +231,14 @@ step = function(dt)
 					setIdle(ball)
 				else
 					local cur = ball.Position
+					if not d.armed then
+						-- appena uscita dalla mano non collide con chi la lancia: si "arma" dopo pochi studs o 0.05s
+						local root = d.thrower and getRoot(d.thrower)
+						if now - d.thrownAt > 0.05 or not root or (cur - root.Position).Magnitude > 3.6 then
+							d.armed = true
+							ball.CanCollide = true
+						end
+					end
 					sweep(ball, d, d.prev, cur)
 					d.prev = cur
 					if d.curve > 0 and ball:GetAttribute("State") == "Thrown" then
@@ -307,6 +319,7 @@ local function createBall(position, kind)
 		thrownForce = Vector3.new(0, weight * (1 - (def.GravityScale or Config.BallGravityScale)), 0),
 		idleForce = Vector3.new(0, weight * (1 - Config.BallIdleGravityScale), 0),
 		thrownAt = 0,
+		armed = true,
 		expireAt = 0,
 		spentUntil = 0,
 		prev = position,
@@ -382,33 +395,94 @@ end
 
 -- ============ Mira assistita ============
 -- Piccolo aiuto alla mira: se un nemico è vicino alla linea di tiro, la palla si piega verso di lui.
-local function applyAimAssist(player, origin, dir)
+-- Ritorna la nuova direzione e la distanza del punto mirato (serve per compensare la caduta).
+local function applyAimAssist(player, origin, dir, dist)
 	local myTeam = player:GetAttribute("TeamIndex")
-	local best
+	local best, bestDist
 	local bestAngle = math.rad(Config.AimAssistAngle)
 	for _, other in Players:GetPlayers() do
 		if other ~= player and other:GetAttribute("InMatch") and other:GetAttribute("TeamIndex") ~= myTeam then
 			local oh = getRoot(other)
 			if oh then
 				local to = oh.Position - origin
-				local dist = to.Magnitude
-				if dist > 3 and dist <= Config.AimAssistRange then
+				local d = to.Magnitude
+				if d > 3 and d <= Config.AimAssistRange then
 					local ang = math.acos(math.clamp(dir:Dot(to.Unit), -1, 1))
 					if ang < bestAngle then
-						best, bestAngle = to.Unit, ang
+						best, bestDist, bestAngle = to.Unit, d, ang
 					end
 				end
 			end
 		end
 	end
 	if best then
-		return dir:Lerp(best, Config.AimAssistStrength).Unit
+		return dir:Lerp(best, Config.AimAssistStrength).Unit, bestDist
 	end
-	return dir
+	return dir, dist
+end
+
+-- Alza la mira quanto basta perché la palla passi dal punto mirato.
+-- Ogni palla compensa la propria caduta, tranne quelle che cadono PIÙ della standard (Heavy): per loro si compensa
+-- come se fossero normali, così "cadono di più" resta la loro identità rispetto al mirino.
+local function compensateDrop(dir, dist, def)
+	local gs = def.GravityScale or Config.BallGravityScale
+	local speed = Config.BallSpeed * (def.Speed or 1)
+	if gs > Config.BallGravityScale then
+		gs, speed = Config.BallGravityScale, Config.BallSpeed
+	end
+	local raise = Ballistics.Raise(
+		workspace.Gravity * gs,
+		speed,
+		dist,
+		dir.Y,
+		Config.BallDropCompensation,
+		math.rad(30)
+	)
+	if raise <= 0 then return dir end
+	local flat = Vector3.new(dir.X, 0, dir.Z)
+	if flat.Magnitude < 1e-3 then return dir end
+	local elev = math.asin(math.clamp(dir.Y, -1, 1)) + raise
+	return (flat.Unit * math.cos(elev) + Vector3.yAxis * math.sin(elev)).Unit
+end
+
+-- ============ Punto di partenza del lancio ============
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+rayParams.CollisionGroup = "Balls" -- come la palla: attraversa la barriera centrale, si ferma su muri e giocatori
+
+-- La palla parte da dove il client dice che era la mano al rilascio (così coincide con ciò che vede chi lancia),
+-- ma solo se è plausibile; altrimenti dalla posizione della palla in mano; altrimenti davanti al petto.
+-- Se tra petto e punto di partenza c'è un muro la palla viene fermata prima: non nasce mai dentro/dietro un ostacolo.
+-- Ritorna posizione e se è stata accorciata da un ostacolo.
+local function resolveStart(char, ball, chest, hint, fallbackDir)
+	local tol = Config.ThrowOriginTolerance
+	local cand
+	if typeof(hint) == "Vector3" and (hint - chest).Magnitude <= tol then
+		cand = hint
+	elseif ball.Parent and (ball.Position - chest).Magnitude <= tol then
+		cand = ball.Position
+	else
+		cand = chest + fallbackDir * 2.5
+	end
+
+	local radius = Config.BallSize / 2
+	local off = cand - chest
+	local len = off.Magnitude
+	if len < 0.01 then return chest, false end
+	local unit = off / len
+	rayParams.FilterDescendantsInstances = { char, ballsFolder }
+	local res = workspace:Raycast(chest, unit * (len + radius), rayParams)
+	if res then
+		local back = res.Distance - radius - 0.05
+		return chest + unit * math.max(back, 0), true
+	end
+	return cand, false
 end
 
 -- ============ Lancio, presa, schivata ============
-function BallService.Throw(player, target)
+-- originHint: posizione della mano al rilascio, comunicata dal client (facoltativa, validata da resolveStart).
+function BallService.Throw(player, target, originHint)
 	local ball = held[player]
 	if not ball or not player:GetAttribute("InMatch") then return end
 	local d = balls[ball]
@@ -419,43 +493,61 @@ function BallService.Throw(player, target)
 	local hrp = getRoot(player)
 	if not hrp then return end
 
-	local origin = hrp.Position + Vector3.new(0, 1.5, 0)
-	local toTarget = target - origin
-	local dist = toTarget.Magnitude
-	if not (dist < Config.MaxThrowTargetDistance) then return end -- scarta bersagli assurdi (inf/NaN o troppo lontani)
+	local chest = hrp.Position + Vector3.new(0, 1.5, 0)
+	local toChest = target - chest
+	if not (toChest.Magnitude < Config.MaxThrowTargetDistance) then return end -- scarta bersagli assurdi (inf/NaN o troppo lontani)
 	lastThrow[player] = now
 
-	local dir = dist > 0.1 and toTarget.Unit or hrp.CFrame.LookVector
-	dir = applyAimAssist(player, origin, dir)
+	local look = hrp.CFrame.LookVector
+	local chestDir = toChest.Magnitude > 0.1 and toChest.Unit or look
+	local startPos, blocked = resolveStart(char, ball, chest, originHint, chestDir)
+
+	-- Direzione dalla posizione reale di partenza al punto mirato (niente errore di parallasse mano/petto)
+	local toTarget = target - startPos
+	local dist = toTarget.Magnitude
+	local aimDir, aimDist
+	if dist > 4 then
+		aimDir, aimDist = toTarget.Unit, dist
+	else
+		aimDir, aimDist = look, 0 -- mira quasi ai piedi: tira dritto davanti a sé
+	end
+	aimDir, aimDist = applyAimAssist(player, startPos, aimDir, aimDist)
+	local dir = compensateDrop(aimDir, aimDist, d.def)
 
 	held[player] = nil
 	player:SetAttribute("HasBall", false)
 	local weld = ball:FindFirstChild("HoldWeld")
 	if weld then weld:Destroy() end
 
+	-- Un ostacolo entro pochi studs davanti alla palla: collide subito. Altrimenti resta "fantasma"
+	-- per un istante per non urtare la mano/il corpo di chi lancia (si arma in step).
+	local armedNow = blocked
+	if not armedNow then
+		rayParams.FilterDescendantsInstances = { char, ballsFolder }
+		armedNow = workspace:Raycast(startPos, dir * 5, rayParams) ~= nil
+	end
+
+	local speed = Config.BallSpeed * (d.def.Speed or 1)
+	d.curveSign = math.random(2) == 1 and 1 or -1
+
 	ball.Massless = false
-	ball.CanCollide = true
+	ball.CanCollide = armedNow
 	ball.CanTouch = true
+	d.armed = armedNow
 	d.vf.Force = d.thrownForce
 	d.vf.Enabled = true
-	-- La palla parte dalla mano (niente "salto" dal petto), ma sempre davanti al corpo
-	local startPos = origin + dir * 2.5
-	local hand = getHand(char)
-	if hand then
-		local p = hand.Position + dir * 1.2
-		local along = (p - origin):Dot(dir)
-		if along < 2 then p += dir * (2 - along) end
-		startPos = p
-	end
 	ball.CFrame = CFrame.new(startPos)
-	ball.AssemblyLinearVelocity = dir * Config.BallSpeed * (d.def.Speed or 1)
+	ball.AssemblyLinearVelocity = dir * speed
+	-- Rotazione: effetto all'indietro lungo la traiettoria (le palle a curva girano di lato)
+	local spinAxis = d.curve > 0 and Vector3.yAxis * d.curveSign or dir:Cross(Vector3.yAxis)
+	ball.AssemblyAngularVelocity = spinAxis * (Config.BallSpin * speed / (Config.BallSize / 2))
 	pcall(function() ball:SetNetworkOwner(nil) end)
 
 	ball.Color = d.def.Color or THROWN_COLOR
+	d.trail:Clear()
 	d.trail.Enabled = true
 	d.bouncesLeft = d.def.Bounces or 0
 	d.lastBounce = 0
-	d.curveSign = math.random(2) == 1 and 1 or -1
 	d.thrower = player
 	d.throwerTeam = player:GetAttribute("TeamIndex")
 	d.thrownAt = now

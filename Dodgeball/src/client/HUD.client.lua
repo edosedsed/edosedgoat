@@ -349,13 +349,18 @@ local function findThreat()
 end
 
 local heldKind, heldTimer = nil, 0
+local lastLeft = -1 -- ultimo valore mostrato dal timer (si riscrive il testo solo quando cambia)
 
 RunService.RenderStepped:Connect(function(dt)
 	message.Text = state.Message
 	if state.EndsAt > 0 then
 		local left = math.max(0, math.ceil(state.EndsAt - workspace:GetServerTimeNow()))
-		timer.Text = string.format("%d:%02d", left // 60, left % 60)
+		if left ~= lastLeft then
+			lastLeft = left
+			timer.Text = string.format("%d:%02d", left // 60, left % 60)
+		end
 	else
+		lastLeft = -1
 		timer.Text = ""
 	end
 
@@ -363,7 +368,11 @@ RunService.RenderStepped:Connect(function(dt)
 	local score = state.Score or { 0, 0 }
 	for i, sp in scorePills do
 		sp.frame.Visible = playing
-		sp.label.Text = string.format("%s  %d  ·  %d pt", Config.Teams[i].Name, state.Alive[i] or 0, score[i] or 0)
+		local alive, pts = state.Alive[i] or 0, score[i] or 0
+		if sp.alive ~= alive or sp.pts ~= pts then
+			sp.alive, sp.pts = alive, pts
+			sp.label.Text = string.format("%s  %d  ·  %d pt", Config.Teams[i].Name, alive, pts)
+		end
 	end
 
 	sdBanner.Visible = playing and state.SuddenDeath == true

@@ -106,8 +106,10 @@ local function gamepadLook(dt)
 end
 
 -- Raggio di collisione della camera: ignora personaggi, palle, vetri e parti non solide
+local filterList = {} -- riusata a ogni frame (niente tabelle nuove 60 volte al secondo)
 local function castCamera(origin, direction, char)
-	local list = {}
+	local list = filterList
+	table.clear(list)
 	if char then table.insert(list, char) end
 	local balls = workspace:FindFirstChild("Balls")
 	if balls then table.insert(list, balls) end

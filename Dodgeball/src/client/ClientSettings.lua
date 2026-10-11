@@ -51,6 +51,7 @@ ClientSettings.Sounds = {
 	Dodge = "",
 	Pickup = "",
 	Hit = "", -- quando colpisci o afferri
+	Impact = "", -- una palla lanciata tocca terra o un muro vicino a te (mancato)
 	Eliminated = "",
 }
 
